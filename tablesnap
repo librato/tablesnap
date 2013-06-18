@@ -55,8 +55,14 @@ class UploadHandler(pyinotify.ProcessEvent):
         return '%s%s:%s' % (self.prefix or '', self.name, pathname)
 
     def add_file(self, filename):
-        if filename.find('-tmp') == -1:
-            self.fileq.put(filename)
+        if filename.find('-tmp') != -1:
+            return
+
+        # XXX: make configurable?
+        if filename.find('/snapshots/') != -1:
+            return
+
+        self.fileq.put(filename)
 
     def get_bucket(self):
         # Reconnect to S3
