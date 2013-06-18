@@ -118,6 +118,14 @@ class UploadHandler(pyinotify.ProcessEvent):
             log.info("Keyname %s exists and file is over 5GB, skipping upload" % keyname)
             return True
 
+        # XXX: the md5 can be expensive, skip files whose size match for
+        # now -- make this an explicit opt-in flag
+        if key.size == stat.st_size:
+            log.info("Keyname %s size matches, skipping upload" % keyname)
+            return True
+        else:
+            return False
+
         # Compute MD5 sum of file
         try:
             fp = open(filename, "r")
