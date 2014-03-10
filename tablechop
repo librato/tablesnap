@@ -1,0 +1,268 @@
+#!/usr/bin/env python
+""" Cleans SSTables on S3 """
+
+import argparse
+import boto
+import json
+import logging
+import os
+import socket
+import sys
+
+from datetime import datetime
+from dateutil import parser as dtparser
+
+
+def hours_ago(args, last_backup_tstamp, tstamp):
+    # Datetime format from the last_modified property on keys from boto
+    last_backup = datetime.strptime(last_backup_tstamp,
+                                    '%Y-%m-%dT%H:%M:%S.%fZ')
+    backup = datetime.strptime(tstamp, '%Y-%m-%dT%H:%M:%S.%fZ')
+    delta = last_backup - backup
+    ## Return days
+    return (((delta.days * 86400) + delta.seconds)/3600)
+
+
+def add_files(key, file_types):
+    if key.name.endswith('-listdir.json'):
+        file_types['listdirfiles'].append(key.size)
+    else:
+        file_types['datafiles'].append(key.size)
+
+
+def get_file_changes(to_delete, key_list, deleted, used):
+    if to_delete:
+        for key_to_add in key_list:
+            ## If it's in to_delete add it to that data structure
+            if key_to_add.name in to_delete:
+                add_files(key_to_add, deleted)
+            else:
+                ## It's not in to_delete, so add the data to "used"
+                add_files(key_to_add, used)
+    else:
+        ## There is no to_delete so just add everything to "used"
+        for key_to_add in key_list:
+            ## There is no to_delete so just add everything to "used"
+            add_files(key_to_add, used)
+
+
+def clean_backups(args, log, s3_key, s3_secret):
+    if args.debug:
+        log.setLevel(logging.DEBUG)
+
+    if not args.name:
+        args.name = socket.getfqdn()
+
+    try:
+        s3conn = boto.connect_s3(s3_key, s3_secret)
+        bucket = s3conn.get_bucket(args.bucket)
+    except boto.exception.BotoServerError, e:
+        log.error('Problem initializing S3 connection: %s', e)
+        sys.exit(1)
+
+    try:
+        key_list = bucket.list("%s:%s" % (args.name, args.path))
+    except boto.exception.BotoServerError, e:
+        log.error('Problem getting keys from S3 bucket: %s', e)
+        sys.exit(1)
+
+    if not args.machine_readable:
+        log.info("Connected to S3, getting keys ...")
+
+    json_keys = []
+    to_delete = set()  # we'll remove from this list
+    keys_that_have_listdir_files = set()
+    keys_that_are_not_listdir_files = set()
+    for k in sorted(
+        key_list,
+        key=lambda k: dtparser.parse(k.last_modified),
+        reverse=True,  # most recent first
+    ):
+        to_delete.add(k.name)
+        if k.name.endswith('-listdir.json'):
+            keys_that_have_listdir_files.add(k.name[:-len('-listdir.json')])
+            json_keys.append(k)
+        else:
+            keys_that_are_not_listdir_files.add(k.name)
+
+    # used to detect starting point for evaluating how far back we should look
+    most_recent_key = json_keys[0]
+
+    log.debug("%s keys total", len(to_delete))
+    log.debug("%s json listdir keys", len(json_keys))
+
+    for jkey in json_keys:
+        log.debug("key dated : %s (%s)", jkey.last_modified,
+                  jkey.name.split('/')[-1])
+        if hours_ago(args, most_recent_key.last_modified,
+                     jkey.last_modified) > args.hours:
+            # We've gone back past our cutoff
+            log.debug("reached cutoff at timestamp %s", jkey.last_modified)
+            break
+        ky = bucket.get_key(jkey)
+        jdict = json.loads(ky.get_contents_as_string())
+        if len(jdict.values()) != 1:
+            raise SystemError('-listdir.json file should have '
+                              'a single key/value pair!')
+        dirname = jdict.keys()[0]
+        # fullpaths here since some files are in subdirectories
+        fullpaths = [os.path.join(dirname, x) for x in jdict.values()[0]]
+        for x in fullpaths:
+            key_to_keep = '%s:%s' % (args.name, x)
+            if key_to_keep in to_delete:
+                to_delete.remove(key_to_keep)
+        if jkey.name in to_delete:
+            to_delete.remove(jkey.name)
+
+    # Find mismatches between the files in the bucket and files
+    # with accompanying -listdir.json files so we can check this
+    # subset of files to determine if any datafiles are missing
+    # a -listdir.json and are also inside of the date cutoff. We
+    # need to make sure files that match that are kept in case a
+    # file was uploaded before it's -listdir.json was uploaded so
+    # we don't delete a file that we should be keeping.
+    without_listdir = (keys_that_are_not_listdir_files -
+                       keys_that_have_listdir_files)
+    for raw_key in keys_that_are_not_listdir_files:
+        if raw_key not in keys_that_have_listdir_files:
+            without_listdir.add(raw_key)
+
+    # Report any keys without -listdir.json files. This should be rare.
+    if without_listdir:
+        log.debug("Keys without listdir files: %s", len(without_listdir))
+
+        # If the files are inside of the time window remove them from the
+        # list of files to be deleted so we don't accidentally delete a newly
+        # uploaded file that doesn't have a -listdir.json file yet. Report this
+        # as well as it should also be a rare occurance
+        for key_list_key in key_list:
+            for without_listdir_file in without_listdir:
+                if key_list_key.name == without_listdir_file:
+                    if hours_ago(args, most_recent_key.last_modified,
+                                 key_list_key.last_modified) < args.hours:
+                        log.debug("Datafile without listdir file found "
+                                  "inside of cutoff date. "
+                                  "Preserving key %s (%s)",
+                                  key_list_key.last_modified,
+                                  key_list_key.name.split('/')[-1])
+                        if key_list_key.name in to_delete:
+                            to_delete.remove(key_list_key.name)
+
+    if args.debug:
+        log.debug("%s non-keeper keys to delete", len(to_delete))
+        ddates = list(set([x.last_modified[:10]
+                      for x in key_list
+                      if x.name in to_delete]))
+        ddates.sort()
+        log.debug("deletion dates : %s", ddates)
+        log.debug("Test mode, nothing deleted")
+        return
+
+    log.debug("Deleting %s keys", len(to_delete))
+
+    try:
+        bucket.delete_keys(to_delete)  # !!
+    except Exception as e:
+        log.error('S3 delete ERR, will try again later [%s]', e)
+
+    deleted = {}
+    deleted['listdirfiles'] = []
+    deleted['datafiles'] = []
+
+    used = {}
+    used['listdirfiles'] = []
+    used['datafiles'] = []
+
+    get_file_changes(to_delete, key_list, deleted, used)
+
+    if args.machine_readable:
+        machine_output = {}
+        machine_output['deleted'] = deleted
+        machine_output['kept'] = used
+        print json.dumps(machine_output)
+
+    else:
+        for key in used:
+            log.info("%7d %12s files    kept: %15d bytes (%5d GB)" %
+                     (len(used[key]), key, sum(used[key]),
+                      sum(used[key])/1024/1024/1024))
+        for key in deleted:
+            log.info("%7d %12s files deleted: %15d bytes (%5d GB)" %
+                     (len(deleted[key]), key, sum(deleted[key]),
+                      sum(deleted[key])/1024/1024/1024))
+
+
+def main(log):
+    parser = argparse.ArgumentParser(
+        description='Clean SSTables from S3. Scroll backwards through '
+        '-listdir.json keys in chronological order collecting a "keeper" '
+        'list until it reaches it\'s age cutoff. Deletes all keys not in that '
+        'list')
+    parser.add_argument(
+        '-d',
+        '--debug',
+        dest='debug',
+        action='store_true',
+        help='Run in debug mode, will not delete keys. Implies -v')
+    parser.add_argument(
+        '--machine-readable',
+        action='store_true',
+        default=False,
+        help='Print JSON output rather than human readable text')
+    parser.add_argument(
+        '-k',
+        '--key',
+        required=True,
+        dest='key_environment_variable_name',
+        help='Amazon S3 Key')
+    parser.add_argument(
+        '-s',
+        '--secret',
+        required=True,
+        dest='secret_environment_variable_name',
+        help='Amazon S3 Secret')
+    parser.add_argument(
+        '-n',
+        '--name',
+        dest='name',
+        required=False,
+        help='Use this name instead of the FQDN to identify the files from '
+             'this host')
+    parser.add_argument(
+        'bucket',
+        help='S3 Bucket')
+    parser.add_argument(
+        'path',
+        help='Path portion of key in S3')
+    parser.add_argument(
+        'hours',
+        type=int,
+        help='How many hours worth of backups to keep')
+    args = parser.parse_args()
+    try:
+        s3_key = os.environ[args.key_environment_variable_name]
+    except KeyError:
+        log.info("No environment variable named \"%s\"",
+                 args.key_environment_variable_name)
+        sys.exit(1)
+    try:
+        s3_secret = os.environ[args.secret_environment_variable_name]
+    except KeyError:
+        log.info("No environment variable named \"%s\"",
+                 args.secret_environment_variable_name)
+        sys.exit(1)
+    clean_backups(args, log, s3_key, s3_secret)
+
+if __name__ == '__main__':
+    log = logging.getLogger('tablechop')
+    stderr = logging.StreamHandler()
+    stderr.setFormatter(logging.Formatter(
+        '%(name)s [%(asctime)s] %(levelname)s %(message)s'))
+    log.addHandler(stderr)
+    if os.environ.get('TDEBUG', False):
+        log.setLevel(logging.DEBUG)
+    else:
+        log.setLevel(logging.INFO)
+
+    main(log)
+
